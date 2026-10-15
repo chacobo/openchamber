@@ -42,6 +42,36 @@ const makeService = (options = {}) => {
 };
 
 describe('relay service passive hosting', () => {
+  it('awaits an asynchronous claim refusal before starting a host', async () => {
+    const { service, hostLock } = makeService();
+    hostLock.tryClaim.mockImplementation(async () => false);
+    hostLock.liveClaimantPid.mockImplementation(async () => 123);
+    try {
+      await service.startIfEnabled();
+      expect(await service.getStatus()).toMatchObject({ state: 'standby', connectedClients: 0 });
+      expect((await service.getStatus()).lastError).toContain('pid 123');
+    } finally {
+      service.stop();
+    }
+  });
+
+  it('does not start a host after stopping during a pending claim', async () => {
+    const { service, hostLock } = makeService();
+    let finish;
+    const entered = new Promise((resolve) => {
+      hostLock.tryClaim.mockImplementation(() => {
+        resolve();
+        return new Promise((done) => { finish = done; });
+      });
+    });
+    const pending = service.startIfEnabled();
+    await entered;
+    service.stop();
+    finish(true);
+    await pending;
+    expect((await service.getStatus()).state).toBe('disabled');
+  });
+
   it('never claims or starts the host passively when passive hosting is disabled', async () => {
     const { service, hostLock } = makeService({ allowPassiveHost: false });
     try {

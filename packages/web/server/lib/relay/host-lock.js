@@ -18,15 +18,32 @@
 // atomicity (the relay worker still enforces a single host); the claim only
 // decides which process KEEPS retrying and which stands down.
 
+import { execFile } from 'node:child_process';
+import path from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
+
+// CreationDate is available even when a service's command line is inaccessible.
+const readWindowsProcessStartedAt = async (pid) => {
+  const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const script = `$ProgressPreference = 'SilentlyContinue'; $p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop; if ($p) { $p.CreationDate.ToUniversalTime().ToString('o') }`;
+  const { stdout } = await execFileAsync(powershell, [
+    '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64'),
+  ], { encoding: 'utf8', timeout: 10_000, windowsHide: true });
+  return Date.parse(stdout.trim());
+};
+
 /**
  * @param {{
  *   lockFilePath: string,
  *   fs?: typeof import('node:fs'),
  *   process?: NodeJS.Process,
  *   logger?: Pick<Console, 'warn'>,
+ *   readProcessStartedAt?: (pid: number) => Promise<number>,
  * }} deps
  */
-export const createRelayHostLock = ({ lockFilePath, fs, process: proc, logger = console }) => {
+export const createRelayHostLock = ({ lockFilePath, fs, process: proc, logger = console, readProcessStartedAt = readWindowsProcessStartedAt }) => {
   const fsImpl = fs;
   const selfPid = proc.pid;
 
@@ -47,7 +64,7 @@ export const createRelayHostLock = ({ lockFilePath, fs, process: proc, logger = 
       const raw = fsImpl.readFileSync(lockFilePath, 'utf8');
       const parsed = JSON.parse(raw);
       const pid = Number(parsed?.pid);
-      return Number.isInteger(pid) && pid > 0 ? { pid } : null;
+      return Number.isInteger(pid) && pid > 0 ? { pid, claimedAt: parsed.claimedAt } : null;
     } catch {
       // Missing file or unparsable content: no valid claim.
       return null;
@@ -67,16 +84,32 @@ export const createRelayHostLock = ({ lockFilePath, fs, process: proc, logger = 
   };
 
   /** The pid of the current live claimant, or null when the claim is free/stale. */
-  const liveClaimantPid = () => {
+  const liveClaimantPid = async () => {
     const claim = readClaim();
-    if (!claim) return null;
-    return isPidAlive(claim.pid) ? claim.pid : null;
+    if (!claim || !isPidAlive(claim.pid)) return null;
+    const claimedAt = Date.parse(claim.claimedAt);
+    if (proc.platform !== 'win32' || claim.pid === selfPid || !Number.isFinite(claimedAt)) return claim.pid;
+    let startedAt;
+    try {
+      startedAt = await readProcessStartedAt(claim.pid);
+    } catch {
+      // Access denied, timeout, or unavailable CIM: preserve a possible live host.
+      return readClaim()?.pid ?? null;
+    }
+    const current = readClaim();
+    // An explicit force-claim during the probe must win over its stale result.
+    if (current?.pid !== claim.pid || current?.claimedAt !== claim.claimedAt) return current?.pid ?? null;
+    return Number.isFinite(startedAt) && startedAt > claimedAt ? null : claim.pid;
   };
 
   /** Claim unless another LIVE process already holds it. Re-claiming our own is a no-op refresh. */
-  const tryClaim = () => {
-    const holder = liveClaimantPid();
+  const tryClaim = async ({ signal } = {}) => {
+    const before = readClaim();
+    const holder = await liveClaimantPid();
+    if (signal?.aborted) return false;
     if (holder !== null && holder !== selfPid) return false;
+    const current = readClaim();
+    if (current?.pid !== before?.pid || current?.claimedAt !== before?.claimedAt) return false;
     return writeClaim();
   };
 
@@ -84,7 +117,7 @@ export const createRelayHostLock = ({ lockFilePath, fs, process: proc, logger = 
   const forceClaim = () => writeClaim();
 
   /** True while this process is the live claimant. */
-  const holdsClaim = () => liveClaimantPid() === selfPid;
+  const holdsClaim = () => readClaim()?.pid === selfPid;
 
   /** Release only our own claim; never delete another process's. */
   const release = () => {

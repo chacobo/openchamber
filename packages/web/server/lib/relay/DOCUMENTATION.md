@@ -38,6 +38,22 @@ Client side (`packages/ui/src/lib/relay/`):
 
 Relay is not a separate link format: it is one transport candidate inside the unified **pairing v2** payload (`packages/ui/src/lib/connectionPayload.ts`). A relay candidate is `{ type: 'relay', relayUrl, serverId, hostEncPubJwk }` — no embedded token; the client redeems the one-time pairing secret over the tunnel like any other candidate.
 
+### Windows claim identity
+
+The claim file also records `claimedAt`. For another live Windows PID,
+`host-lock.js` asynchronously reads `Win32_Process.CreationDate` through a hidden
+PowerShell process. A process created after the recorded claim proves PID reuse
+and makes the claim stale. The probe has a 10-second timeout and never blocks the
+server event loop. Missing or invalid timestamps and unavailable process metadata
+retain the liveness-only behavior. Other platforms keep their existing behavior.
+The current process's own claim requires no subprocess.
+
+`liveClaimantPid()` and `tryClaim()` are asynchronous. `holdsClaim()`,
+`forceClaim()`, and `release()` remain synchronous. A claim changed during a probe
+is preserved, and stopping the service cancels pending acquisitions. The watcher
+runs at most one probe cycle at a time. Explicit takeover and the restart grace
+period are unchanged. No persisted-file migration is needed.
+
 ## What travels the tunnel
 
 Everything a client normally sends to the single OpenChamber origin:

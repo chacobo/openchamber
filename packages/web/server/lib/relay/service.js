@@ -101,6 +101,9 @@ export const createRelayService = ({
   // wait, so it always wins the window.
   const CLAIM_TAKEOVER_GRACE_MS = 120_000;
   let claimFreeSinceMs = null;
+  let lifecycle = 0;
+  let claimAbort = new AbortController();
+  let claimWatchRunning = false;
 
   const readConfig = async () => {
     const settings = await readSettingsFromDiskMigrated();
@@ -143,19 +146,23 @@ export const createRelayService = ({
   const ensureClaimWatch = (relayUrl) => {
     if (!hostLock || claimWatchTimer) return;
     claimWatchTimer = setInterval(() => {
+      if (claimWatchRunning) return;
+      claimWatchRunning = true;
+      const generation = lifecycle;
       void (async () => {
         try {
+          const holder = await hostLock.liveClaimantPid();
+          if (generation !== lifecycle) return;
           if (hostClient) {
-            if (!hostLock.holdsClaim() && hostLock.liveClaimantPid() !== null) {
+            if (holder !== null && !hostLock.holdsClaim()) {
               logger.warn('[Relay] host claim taken by another local instance — standing down');
-              const holder = hostLock.liveClaimantPid();
               stopHostClient();
               status = standbyStatus(holder);
             }
             return;
           }
           if (status.state !== 'standby' || !allowPassiveHost) return;
-          if (hostLock.liveClaimantPid() !== null) {
+          if (holder !== null) {
             claimFreeSinceMs = null;
             return;
           }
@@ -164,13 +171,16 @@ export const createRelayService = ({
             return;
           }
           if (Date.now() - claimFreeSinceMs < CLAIM_TAKEOVER_GRACE_MS) return;
-          if (hostLock.tryClaim()) {
+          if (await hostLock.tryClaim({ signal: claimAbort.signal })) {
+            if (generation !== lifecycle) return;
             claimFreeSinceMs = null;
             logger.warn('[Relay] host claim stayed free — taking over the relay host');
             await start(relayUrl);
           }
         } catch (error) {
           logger.warn(`[Relay] claim watch failed: ${describeRelayError(error)}`);
+        } finally {
+          claimWatchRunning = false;
         }
       })();
     }, CLAIM_WATCH_INTERVAL_MS);
@@ -185,6 +195,7 @@ export const createRelayService = ({
   };
 
   const start = async (relayUrl, { claim = 'try' } = {}) => {
+    const generation = lifecycle;
     if (hostClient) return;
     // Every path into the relay host passes here: boot, demand, enable, pairing.
     if (relayBlockedByEnterprise()) {
@@ -200,14 +211,18 @@ export const createRelayService = ({
       return;
     }
     if (hostLock) {
-      const claimed = claim === 'force' ? hostLock.forceClaim() : hostLock.tryClaim();
+      const claimed = claim === 'force' ? hostLock.forceClaim() : await hostLock.tryClaim({ signal: claimAbort.signal });
+      if (generation !== lifecycle || hostClient) return;
       if (!claimed) {
-        status = standbyStatus(hostLock.liveClaimantPid());
+        const holder = await hostLock.liveClaimantPid();
+        if (generation !== lifecycle || hostClient) return;
+        status = standbyStatus(holder);
         ensureClaimWatch(relayUrl);
         return;
       }
     }
     const identity = await identityRuntime.getRelayIdentity();
+    if (generation !== lifecycle || hostClient) return;
     hostClient = startRelayHost({
       relayUrl,
       identity,
@@ -222,6 +237,9 @@ export const createRelayService = ({
   };
 
   const stop = () => {
+    lifecycle += 1;
+    claimAbort.abort();
+    claimAbort = new AbortController();
     stopClaimWatch();
     stopHostClient();
     if (hostLock) hostLock.release();
