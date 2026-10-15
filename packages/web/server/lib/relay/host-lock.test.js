@@ -132,10 +132,98 @@ describe('relay host lock', () => {
   });
 
   const claimedAt = '2026-10-15T10:00:00.000Z';
-  const makeWindowsLock = (fs, readProcessStartedAt) => createRelayHostLock({
+  const makeWindowsLock = (fs, readProcessStartedAt, options = {}) => createRelayHostLock({
     lockFilePath: LOCK, fs,
     process: { ...makeFakeProcess(200, new Set([100, 200, 300])), platform: 'win32' },
-    logger: silentLogger, readProcessStartedAt,
+    logger: silentLogger, readProcessStartedAt, ...options,
+  });
+
+  it('caches creation-time results by pid and claimedAt while still checking liveness', async () => {
+    const fs = makeFakeFs();
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: 100, claimedAt }));
+    let probes = 0;
+    let kills = 0;
+    const originalKill = makeFakeProcess(200, new Set([100, 200, 300])).kill;
+    // Count the kill(pid, 0) liveness checks separately from cached inspection.
+    const proc = { pid: 200, platform: 'win32', kill: (...args) => { kills += 1; return originalKill(...args); } };
+    const countedLock = createRelayHostLock({ lockFilePath: LOCK, fs, process: proc, logger: silentLogger, readProcessStartedAt: async () => { probes += 1; return NaN; } });
+
+    expect(await countedLock.liveClaimantPid()).toBe(100);
+    expect(await countedLock.liveClaimantPid()).toBe(100);
+    expect(probes).toBe(1);
+    expect(kills).toBe(2);
+  });
+
+  it('expires a cached result at the TTL so a reused PID can be reclaimed', async () => {
+    const fs = makeFakeFs();
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: 100, claimedAt }));
+    let now = 0;
+    let startedAt = Date.parse(claimedAt);
+    let probes = 0;
+    const lock = makeWindowsLock(fs, async () => { probes += 1; return startedAt; }, { now: () => now });
+    expect(await lock.liveClaimantPid()).toBe(100);
+    startedAt = Date.parse(claimedAt) + 1000;
+    now = 299_999;
+    expect(await lock.liveClaimantPid()).toBe(100);
+    now = 300_000;
+    expect(await lock.liveClaimantPid()).toBeNull();
+    expect(probes).toBe(2);
+  });
+
+  it('probes immediately when claimedAt changes for the same PID', async () => {
+    const fs = makeFakeFs();
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: 100, claimedAt }));
+    let probes = 0;
+    const lock = makeWindowsLock(fs, async () => { probes += 1; return NaN; });
+    expect(await lock.liveClaimantPid()).toBe(100);
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: 100, claimedAt: '2026-10-15T11:00:00.000Z' }));
+    expect(await lock.liveClaimantPid()).toBe(100);
+    expect(probes).toBe(2);
+  });
+
+  it('caches inspection failures until expiry, then retries', async () => {
+    const fs = makeFakeFs();
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: 100, claimedAt }));
+    let now = 0;
+    let probes = 0;
+    const lock = makeWindowsLock(fs, async () => { probes += 1; throw new Error('Access denied'); }, { now: () => now });
+    expect(await lock.liveClaimantPid()).toBe(100);
+    expect(await lock.liveClaimantPid()).toBe(100);
+    expect(probes).toBe(1);
+    now = 300_000;
+    expect(await lock.liveClaimantPid()).toBe(100);
+    expect(probes).toBe(2);
+  });
+
+  it('shares a pending creation-time probe for concurrent identical claims', async () => {
+    const fs = makeFakeFs();
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: 100, claimedAt }));
+    let finish;
+    let probes = 0;
+    const lock = makeWindowsLock(fs, () => { probes += 1; return new Promise((resolve) => { finish = resolve; }); });
+    const first = lock.liveClaimantPid();
+    const second = lock.liveClaimantPid();
+    expect(probes).toBe(1);
+    finish(NaN);
+    expect(await Promise.all([first, second])).toEqual([100, 100]);
+  });
+
+  it('clears cached probes when a claim is missing or the PID is dead', async () => {
+    const fs = makeFakeFs();
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: 100, claimedAt }));
+    const alive = new Set([100, 200]);
+    let probes = 0;
+    const lock = createRelayHostLock({ lockFilePath: LOCK, fs, process: { ...makeFakeProcess(200, alive), platform: 'win32' }, logger: silentLogger, readProcessStartedAt: async () => { probes += 1; return NaN; } });
+    expect(await lock.liveClaimantPid()).toBe(100);
+    fs.unlinkSync(LOCK);
+    expect(await lock.liveClaimantPid()).toBeNull();
+    fs.writeFileSync(LOCK, JSON.stringify({ pid: 100, claimedAt }));
+    expect(await lock.liveClaimantPid()).toBe(100);
+    alive.delete(100);
+    expect(await lock.liveClaimantPid()).toBeNull();
+    alive.add(100);
+    expect(await lock.liveClaimantPid()).toBe(100);
+    expect(probes).toBe(3);
   });
 
   it('reclaims a live Windows PID created after the persisted claim', async () => {

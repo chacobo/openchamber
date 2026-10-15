@@ -23,6 +23,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+const PROCESS_IDENTITY_RECHECK_MS = 5 * 60_000;
 
 // CreationDate is available even when a service's command line is inaccessible.
 const readWindowsProcessStartedAt = async (pid) => {
@@ -41,11 +42,13 @@ const readWindowsProcessStartedAt = async (pid) => {
  *   process?: NodeJS.Process,
  *   logger?: Pick<Console, 'warn'>,
  *   readProcessStartedAt?: (pid: number) => Promise<number>,
+ *   now?: () => number,
  * }} deps
  */
-export const createRelayHostLock = ({ lockFilePath, fs, process: proc, logger = console, readProcessStartedAt = readWindowsProcessStartedAt }) => {
+export const createRelayHostLock = ({ lockFilePath, fs, process: proc, logger = console, readProcessStartedAt = readWindowsProcessStartedAt, now = () => performance.now() }) => {
   const fsImpl = fs;
   const selfPid = proc.pid;
+  let identityProbe = null;
 
   const isPidAlive = (pid) => {
     if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -86,16 +89,31 @@ export const createRelayHostLock = ({ lockFilePath, fs, process: proc, logger = 
   /** The pid of the current live claimant, or null when the claim is free/stale. */
   const liveClaimantPid = async () => {
     const claim = readClaim();
-    if (!claim || !isPidAlive(claim.pid)) return null;
-    const claimedAt = Date.parse(claim.claimedAt);
-    if (proc.platform !== 'win32' || claim.pid === selfPid || !Number.isFinite(claimedAt)) return claim.pid;
-    let startedAt;
-    try {
-      startedAt = await readProcessStartedAt(claim.pid);
-    } catch {
-      // Access denied, timeout, or unavailable CIM: preserve a possible live host.
-      return readClaim()?.pid ?? null;
+    if (!claim || !isPidAlive(claim.pid)) {
+      identityProbe = null;
+      return null;
     }
+    const claimedAt = Date.parse(claim.claimedAt);
+    if (proc.platform !== 'win32' || claim.pid === selfPid || !Number.isFinite(claimedAt)) {
+      identityProbe = null;
+      return claim.pid;
+    }
+    if (identityProbe?.pid !== claim.pid || identityProbe?.claimedAt !== claim.claimedAt || now() >= identityProbe.expiresAt) {
+      const probe = { pid: claim.pid, claimedAt: claim.claimedAt, expiresAt: Infinity, result: null };
+      // Share an in-flight lookup; inconclusive probes use the same retry bound.
+      probe.result = (async () => {
+        try {
+          return await readProcessStartedAt(claim.pid);
+        } catch {
+          // Access denied, timeout, or unavailable CIM: preserve a possible host.
+          return NaN;
+        } finally {
+          probe.expiresAt = now() + PROCESS_IDENTITY_RECHECK_MS;
+        }
+      })();
+      identityProbe = probe;
+    }
+    const startedAt = await identityProbe.result;
     const current = readClaim();
     // An explicit force-claim during the probe must win over its stale result.
     if (current?.pid !== claim.pid || current?.claimedAt !== claim.claimedAt) return current?.pid ?? null;

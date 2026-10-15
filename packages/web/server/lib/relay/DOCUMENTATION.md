@@ -46,7 +46,13 @@ PowerShell process. A process created after the recorded claim proves PID reuse
 and makes the claim stale. The probe has a 10-second timeout and never blocks the
 server event loop. Missing or invalid timestamps and unavailable process metadata
 retain the liveness-only behavior. Other platforms keep their existing behavior.
-The current process's own claim requires no subprocess.
+The current process's own claim requires no subprocess. For an unchanged foreign
+claim, the creation-time result is reused for 5 minutes, including failed or
+inconclusive probes. Concurrent checks share one pending lookup. Every watcher
+cycle still checks PID liveness; a dead PID, missing claim, or changed claim
+invalidates the result. The cache holds only one claim and uses a monotonic clock.
+PID reuse missed between watcher cycles is detected on the next identity probe,
+then the existing takeover grace applies. A new lock instance probes immediately.
 
 `liveClaimantPid()` and `tryClaim()` are asynchronous. `holdsClaim()`,
 `forceClaim()`, and `release()` remain synchronous. A claim changed during a probe
